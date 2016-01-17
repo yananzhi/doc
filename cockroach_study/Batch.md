@@ -2,6 +2,7 @@
 
 # batch的使用
 客户端可以把多个命令打包在一起．读写命令也可以打包在一起. 读写命令应该可以打包在一起．
+- 带事务的batch
 ```
 ba := client.Txn.NewBatch()
 ba.Put("key1", "a")
@@ -10,10 +11,64 @@ if err := cleint.Txn.Run(ba); err != nil{
 	// error hanle
 }
 ```
+- 不带事务的batch
+```go
+func runPut(cmd *cobra.Command, args []string) {
+	if len(args) == 0 || len(args)%2 == 1 {
+		mustUsage(cmd)
+		return
+	}
+
+	var b client.Batch
+	for i := 0; i < len(args); i += 2 {
+		b.Put(
+			unquoteArg(args[i], true /* disallow system keys */),
+			unquoteArg(args[i+1], false),
+		)
+	}
+
+	kvDB, stopper := makeDBClient()
+	defer stopper.Stop()
+
+	if err := kvDB.Run(&b); err != nil {
+		panicf("put failed: %s", err)
+	}
+}
+```
 distSender负责把一个batch命令拆分开
 - 第一层，把不属性的命令拆分开，拆分的代码见```func (ba BatchRequest) Split(canSplitET bool) [][]RequestUnion ```.有一些命令是不能够在一起执行的．todo:列出来哪些命令不能够在一起执行.  把不同属性分开，是靠distSender里面的sendChunk的区分
 - 把向不同range发送的命令进行拆分,  分别发送至不同的```range```
 这里使用```func Range(ba roachpb.BatchRequest) roachpb.RSpan```函数，来计算出来一个batch涉及的keys,实际就是计算出来这个batch里面的最大key与最小key
+
+
+# batch的行为分析．
+客户端生成一个batch,这个batch可是基于一个事务生成的batch,也可以是用```client.DB```来运行一个batch  
+
+## client.DB运行一个batch```func (db *DB) Run(b *Batch) *roachpb.Error```
+ 如果客户端使用```func (db *DB) Run(b *Batch) *roachpb.Error```它会有以下的行为:
+ - 首先，客户端会把一个batch当成一个命令发送给Txn_coordinator_sender
+ 以前的代码里面说明一个batch是一个客户端并发的单元，实际上现在已经没有这个功能．
+ - 如果这一个batch并没有跨range, 那么这个batch会利用rocksdb的原子提交特性一起提交．
+ - 如果这一个batch跨了range,那么它会被包装成一个事务，进行提交．
+ - distSender会把一个batch里面所有的内容发送给replica, replica负责检查batch的哪些操作属于自己,代码参见
+ ```go
+ func (r *Replica) executeCmd(batch engine.Engine, ms *engine.MVCCStats, h roachpb.Header, args roachpb.Request) (roachpb.Response, []roachpb.Intent, *roachpb.Error) {
+	// Verify key is contained within range here to catch any range split
+	// or merge activity.
+	ts := h.Timestamp
+
+	if _, ok := args.(*roachpb.NoopRequest); ok {
+		return &roachpb.NoopResponse{}, nil, nil
+	}
+
+	if pErr := r.checkCmdHeader(args.Header()); pErr != nil {
+		pErr.Txn = h.Txn
+		return nil, nil, pErr
+	}
+ ```
+ 
+## 带事务的batch
+行为基于与不带事务的batch一样，但是所有的写入行都会作为一个事务来提交
 
 # resolveIntent
 正常一个事务结束(EndTransaction成功以后)，需要resolveIntent,把所有写入行的intent清除掉，以前这个操作是txn_coordinator发起的，而现在有了优化 ,在endTransaction执行成功的node上直接进行resolveIntent,可以减少消息的来回，而且与endtransaction处于同一个replica的写命令可以与endtransaction走同一个rocksdb的原子提交
